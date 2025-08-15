@@ -1,0 +1,565 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  CloudFormation template for CI/CD with GitHub Actions, CodeDeploy, Tomcat 9, Amazon Linux 2023, and Amazon Corretto 11.
+  **WARNING**: This creates billable AWS resources.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "VPC Configurations"
+        Parameters:
+          - VpcCIDR
+          - PublicSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PrivateSubnet1CIDR
+          - PrivateSubnet2CIDR
+      - Label:
+          default: "Autoscaling Configurations"
+        Parameters:
+          - InstanceType
+          - AutoScalingGroupMinSize
+          - AutoScalingGroupMaxSize
+          - AutoScalingGroupDesiredCapacity
+      - Label:
+          default: "GitHub Configurations"
+        Parameters:
+          - GithubRepoName
+          - ThumbprintList
+
+Parameters:
+  VpcCIDR:
+    Description: IP range (CIDR) for the VPC
+    Type: String
+    Default: 10.192.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: CIDR for public subnet in AZ1
+    Type: String
+    Default: 10.192.10.0/24
+
+  PublicSubnet2CIDR:
+    Description: CIDR for public subnet in AZ2
+    Type: String
+    Default: 10.192.11.0/24
+
+  PrivateSubnet1CIDR:
+    Description: CIDR for private subnet in AZ1
+    Type: String
+    Default: 10.192.20.0/24
+
+  PrivateSubnet2CIDR:
+    Description: CIDR for private subnet in AZ2
+    Type: String
+    Default: 10.192.21.0/24
+
+  InstanceType:
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    Description: EC2 instance type.
+
+  AutoScalingGroupMinSize:
+    Type: Number
+    Default: 2
+    Description: Min instances in ASG.
+
+  AutoScalingGroupMaxSize:
+    Type: Number
+    Default: 4
+    Description: Max instances in ASG.
+
+  AutoScalingGroupDesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of instances.
+
+  ThumbprintList:
+    Type: String
+    Default: 6938fd4d98bab03faadb97b34396831e3780aea1
+    Description: GitHub OIDC provider thumbprint.
+
+  GithubRepoName:
+    Type: String
+    Description: GitHub repo (e.g., user/repo)
+
+Resources:
+  # ========================================
+  # VPC & Networking
+  # ========================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet (AZ1)
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet (AZ2)
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Private Subnet (AZ1)
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: Private Subnet (AZ2)
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # ========================================
+  # IAM Roles & Profiles
+  # ========================================
+  WebappRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: "/"
+      RoleName: WebappRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: allow-s3-deployment-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${WebappDeploymentBucket}/*"
+
+  IDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - !Ref ThumbprintList
+
+  GitHubIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: "/"
+      RoleName: CodeDeployRoleForGitHub
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Ref IDCProvider
+            Condition:
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GithubRepoName}:*"
+      MaxSessionDuration: 3600
+      Description: IAM role for GitHub Actions to deploy via CodeDeploy
+      Policies:
+        - PolicyName: CodeDeployAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codedeploy:Get*
+                  - codedeploy:Batch*
+                  - codedeploy:CreateDeployment
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:List*
+                Resource: !Sub "arn:${AWS::Partition}:codedeploy:*:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${WebappDeploymentBucket}/*"
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  WebappInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebappRole
+
+  # ========================================
+  # Launch Template (Amazon Linux 2023 + Corretto 11)
+  # ========================================
+  WebappLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64   # ✅ Amazon Linux 2023
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !Ref WebappSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref WebappInstanceProfile
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              exec > /var/log/user-data.log 2>&1
+              set -x
+
+              # Wait for internet access via NAT
+              echo "Waiting for internet access..."
+              for i in {1..10}; do
+                if curl -s --connect-timeout 10 http://169.254.169.254/latest/meta-data/ &> /dev/null; then
+                  echo "Internet access OK."
+                  break
+                else
+                  echo "Attempt $i failed. Retrying in 15 seconds..."
+                  sleep 15
+                fi
+              done
+
+              # Update and install required packages
+              dnf update -y
+              dnf install -y java-11-amazon-corretto-headless wget unzip
+
+              # Verify Java
+              java -version
+
+              # Install Tomcat
+              cd /usr/local
+              wget https://archive.apache.org/dist/tomcat/tomcat-9/v9.0.43/bin/apache-tomcat-9.0.43.zip
+              unzip apache-ttomcat-9.0.43.zip
+              mv apache-tomcat-9.0.43 tomcat9
+              chown -R ec2-user:ec2-user tomcat9
+
+              # Create systemd service
+              cat > /etc/systemd/system/tomcat.service << 'EOF'
+              [Unit]
+              Description=Apache Tomcat Server
+              After=network.target
+
+              [Service]
+              Type=forking
+              User=ec2-user
+              Group=ec2-user
+              Environment=CATALINA_PID=/usr/local/tomcat9/temp/tomcat.pid
+              Environment=CATALINA_HOME=/usr/local/tomcat9
+              Environment=CATALINA_BASE=/usr/local/tomcat9
+              ExecStart=/usr/local/tomcat9/bin/catalina.sh start
+              ExecStop=/usr/local/tomcat9/bin/catalina.sh stop
+              RestartSec=10
+              Restart=always
+
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+
+              # Enable and start Tomcat
+              systemctl daemon-reload
+              systemctl enable tomcat.service
+              systemctl start tomcat.service
+
+              # Health check script (optional, for monitoring)
+              cat > /usr/local/bin/health-check.sh << 'EOF'
+              #!/bin/bash
+              curl -f http://localhost:8080/ || exit 1
+              EOF
+              chmod +x /usr/local/bin/health-check.sh
+
+              # Install CodeDeploy Agent
+              dnf install -y ruby
+              wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+              chmod +x ./install
+              ./install auto
+
+              # Install SSM Agent (usually pre-installed, but ensure)
+              dnf install -y amazon-ssm-agent
+              systemctl enable amazon-ssm-agent
+              systemctl start amazon-ssm-agent
+
+              echo "User data completed."
+
+  # ========================================
+  # Auto Scaling Group
+  # ========================================
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebappLaunchTemplate
+        Version: !GetAtt WebappLaunchTemplate.LatestVersionNumber   # ✅ Safe
+      MinSize: !Ref AutoScalingGroupMinSize
+      MaxSize: !Ref AutoScalingGroupMaxSize
+      DesiredCapacity: !Ref AutoScalingGroupDesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: webapp-example
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref AutoScalingGroupMinSize
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+
+  # ========================================
+  # Security Groups
+  # ========================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  WebappSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to EC2
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  # ========================================
+  # Load Balancer
+  # ========================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: InternetGateway
+    Properties:
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VPC
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ========================================
+  # CodeDeploy
+  # ========================================
+  WebappApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: CodeDeployAppNameWithASG
+
+  WebappDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref WebappApplication
+      DeploymentGroupName: CodeDeployGroupName
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_REQUEST
+      AutoScalingGroups:
+        - !Ref AutoScalingGroup
+
+  # ========================================
+  # S3 Bucket
+  # ========================================
+  WebappDeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+Outputs:
+  WebappUrl:
+    Description: URL of the web application
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}:8080/SpringBootHelloWorldExampleApplication"
+
+  DeploymentGroup:
+    Description: CodeDeploy Deployment Group
+    Value: !Ref WebappDeploymentGroup
+
+  DeploymentBucket:
+    Description: S3 Bucket for deployment artifacts
+    Value: !Ref WebappDeploymentBucket
+
+  ApplicationName:
+    Description: CodeDeploy Application Name
+    Value: !Ref WebappApplication
+
+  GithubIAMRoleArn:
+    Description: IAM Role ARN for GitHub Actions
+    Value: !GetAtt GitHubIAMRole.Arn
